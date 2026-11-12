@@ -1,0 +1,58 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Signing key (from encrypted repository secret)
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          echo "$KS_B64" | base64 -d > app/release.keystore
+          test -s app/release.keystore
+
+      - name: Check key matches the site verification file
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          FP=$(keytool -list -v -storetype pkcs12 -keystore app/release.keystore -storepass "$KS_PASS" | grep -m1 "SHA256:" | awk '{print $2}')
+          echo "Key fingerprint: $FP"
+          test "$FP" = "D5:75:21:03:59:3F:E2:16:00:07:F7:34:E0:BF:2A:47:4C:00:FA:A4:D5:AF:FE:96:C8:DB:03:66:9D:D4:D0:12"
+
+      - name: Build
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: gradle assembleRelease --stacktrace --no-daemon
+
+      - name: Publish download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk our-family.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest our-family.apk --title "המשפחה שלנו - אנדרואיד (בנייה ${{ github.run_number }})" --notes "נבנה אוטומטית. האפליקציה מתעדכנת מעצמה מהשרת, אין צורך להוריד מחדש בכל עדכון."
