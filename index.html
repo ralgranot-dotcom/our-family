@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>המשפחה שלנו</title>
+  <meta name="description" content="המשפחה שלנו — המקום שבו כל המשפחה נפגשת. תיאום אירועים, אישורי הגעה ולוח שנה משפחתי." />
+  <meta name="theme-color" content="#3f74c9" />
+  <meta name="application-name" content="המשפחה שלנו" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="המשפחה שלנו" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="author" content="איתן נוה" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icons/icon-192.png" type="image/png" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css?v=1.0.0" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+</head>
+<body>
+  <div id="root">
+    <div class="splash"><div class="logo">❤️</div><h1>המשפחה שלנו</h1><div class="muted">המקום שבו כל המשפחה נפגשת.</div><div class="credit">תוכנן ויוצר ע״י איתן נוה</div></div>
+  </div>
+  <noscript><p style="text-align:center;padding:20px">כדי להשתמש באפליקציה יש לאפשר JavaScript בדפדפן.</p></noscript>
+  <script>
+    // אם הספריות לא נטענו (למשל אין אינטרנט בפתיחה הראשונה) — הודעה ברורה במקום מסך ריק
+    window.addEventListener("error", function (e) {
+      if (window.__booted) return;
+      setTimeout(function () {
+        if (window.__booted) return;
+        var r = document.getElementById("root");
+        if (r) r.innerHTML = '<div class="splash"><div class="logo">📴</div><h1>המשפחה שלנו</h1><p>לא ניתן לטעון את האפליקציה. בדוק את חיבור האינטרנט ונסה שוב.</p><button class="btn primary" onclick="location.reload()">נסה שוב</button></div>';
+      }, 4000);
+    }, true);
+  </script>
+  <script type="module" src="./app.js?v=1.0.0"></script>
+</body>
+</html>
