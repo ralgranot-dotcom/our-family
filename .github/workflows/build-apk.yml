@@ -53,6 +53,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/release/app-release.apk our-family.apk
+          cp app/build/outputs/apk/release/app-release.apk hamishpacha
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest our-family.apk --title "המשפחה שלנו - אנדרואיד (בנייה ${{ github.run_number }})" --notes "נבנה אוטומטית. האפליקציה מתעדכנת מעצמה מהשרת, אין צורך להוריד מחדש בכל עדכון."
+          gh release create latest hamishpacha --title "המשפחה שלנו - אנדרואיד (בנייה ${{ github.run_number }})" --notes "נבנה אוטומטית. האפליקציה מתעדכנת מעצמה מהשרת, אין צורך להוריד מחדש בכל עדכון."
