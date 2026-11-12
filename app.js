@@ -62,8 +62,20 @@ const hm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 const fmtDate = (iso, o = {}) => new Intl.DateTimeFormat("he-IL", { weekday: "long", day: "numeric", month: "long", ...o }).format(new Date(iso));
 const fmtTime = (iso) => new Intl.DateTimeFormat("he-IL", { hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
 const fmtShort = (iso) => new Intl.DateTimeFormat("he-IL", { day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
+export function gematria(n) {
+  n = Number(n) % 1000; if (!n) return "";
+  const H = [[400, "ת"], [300, "ש"], [200, "ר"], [100, "ק"], [90, "צ"], [80, "פ"], [70, "ע"], [60, "ס"], [50, "נ"], [40, "מ"], [30, "ל"], [20, "כ"], [10, "י"], [9, "ט"], [8, "ח"], [7, "ז"], [6, "ו"], [5, "ה"], [4, "ד"], [3, "ג"], [2, "ב"], [1, "א"]];
+  let out = "";
+  while (n >= 400) { out += "ת"; n -= 400; }
+  if (n === 15 || n === 16 || n % 100 === 15 || n % 100 === 16) { const h = n - (n % 100); for (const [v, l] of H) if (h >= v && v >= 100) { out += l; break; } out += n % 100 === 15 ? "טו" : "טז"; n = 0; }
+  for (const [v, l] of H) while (n >= v) { out += l; n -= v; }
+  return out.length > 1 ? out.slice(0, -1) + "״" + out.slice(-1) : out + "׳";
+}
 function hebDate(d, withYear = true) {
-  try { return new Intl.DateTimeFormat("he-IL-u-ca-hebrew", withYear ? { day: "numeric", month: "long", year: "numeric" } : { day: "numeric", month: "long" }).format(new Date(d)); } catch (_) { return ""; }
+  try {
+    const parts = new Intl.DateTimeFormat("he-IL-u-ca-hebrew", withYear ? { day: "numeric", month: "long", year: "numeric" } : { day: "numeric", month: "long" }).formatToParts(new Date(d));
+    return parts.map((p) => ((p.type === "day" || p.type === "year") && /^\d+$/.test(p.value) ? gematria(p.value) : p.value)).join("");
+  } catch (_) { return ""; }
 }
 function relTime(iso) {
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -125,7 +137,7 @@ const store = {
 };
 function useStore() {
   const [s, setS] = useState(store.s);
-  useEffect(() => { store.subs.add(setS); return () => store.subs.delete(setS); }, []);
+  useEffect(() => { store.subs.add(setS); setS(store.s); return () => { store.subs.delete(setS); }; }, []);
   return s;
 }
 let toastTimer;
