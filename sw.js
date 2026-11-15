@@ -1,8 +1,8 @@
 // "המשפחה שלנו" — Service Worker: עבודה ללא חיבור + התראות דחיפה
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const CACHE = "our-family-" + VERSION;
 const PRECACHE = [
-  "./", "./index.html", "./styles.css?v=1.0.0", "./app.js?v=1.0.0", "./config.js", "./manifest.webmanifest", "./version.json",
+  "./", "./index.html", "./styles.css?v=1.1.0", "./app.js?v=1.1.0", "./config.js", "./manifest.webmanifest", "./version.json",
   "./icons/icon-192.png", "./icons/icon-maskable-512.png", "./icons/badge-96.png",
   "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js",
   "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js",

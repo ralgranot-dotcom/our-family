@@ -130,7 +130,7 @@ const store = {
   s: {
     boot: true, session: null, me: null, myMemberships: [], families: [], members: [], profiles: {}, events: [], rsvps: [], invitees: [],
     notifications: [], avatars: {}, familyId: LS.get("fam-current", null), online: navigator.onLine, syncing: false, lastSync: null,
-    toast: null, update: null, queue: LS.get("fam-queue", []), loadError: null,
+    toast: null, update: null, queue: LS.get("fam-queue", []), loadError: null, tree: [], treePhotos: {}, updating: false,
   },
   subs: new Set(),
   set(patch) { this.s = { ...this.s, ...(typeof patch === "function" ? patch(this.s) : patch) }; this.subs.forEach((f) => f(this.s)); },
@@ -183,12 +183,33 @@ async function loadAll() {
       store.set(next); LS.set("fam-current", familyId);
       LS.set("fam-cache-" + uid, next);
       loadAvatars(profs || []);
+      loadTree().catch(() => {});
     } catch (e) {
       store.set({ loadError: friendlyError(e) });
       throw e;
     } finally { store.set({ syncing: false }); loading = null; }
   })();
   return loading;
+}
+const treePhotoCache = {};
+async function loadTree() {
+  const ids = store.s.myMemberships.filter((m) => m.status === "active").map((m) => m.family_id);
+  if (!ids.length) { store.set({ tree: [] }); return; }
+  const { data, error } = await sb.from("fam_tree_people").select("*").in("family_id", ids);
+  if (error) throw error;
+  store.set({ tree: data || [] });
+  const uid = store.s.session?.user?.id;
+  if (uid) { const c = LS.get("fam-cache-" + uid, null); if (c) LS.set("fam-cache-" + uid, { ...c, tree: data || [] }); }
+  loadTreePhotos(data || []).catch(() => {});
+}
+async function loadTreePhotos(list) {
+  const need = [...new Set(list.filter((p) => p.photo_path && !treePhotoCache[p.photo_path]).map((p) => p.photo_path))];
+  if (need.length) {
+    const { data } = await sb.storage.from("fam-media").createSignedUrls(need, 3600 * 6);
+    (data || []).forEach((d) => { if (d.signedUrl) treePhotoCache[d.path] = d.signedUrl; });
+  }
+  const map = {}; list.forEach((p) => { if (p.photo_path && treePhotoCache[p.photo_path]) map[p.id] = treePhotoCache[p.photo_path]; });
+  store.set({ treePhotos: map });
 }
 async function loadAvatars(profs) {
   const paths = profs.filter((p) => p.avatar_path).map((p) => p.avatar_path);
@@ -201,7 +222,7 @@ async function loadAvatars(profs) {
 function startRealtime(uid) {
   if (channel) sb.removeChannel(channel);
   channel = sb.channel("fam-live-" + uid);
-  for (const t of ["fam_events", "fam_rsvps", "fam_members", "fam_profiles", "fam_event_invitees"]) channel.on("postgres_changes", { event: "*", schema: "public", table: t }, () => scheduleReload());
+  for (const t of ["fam_events", "fam_rsvps", "fam_members", "fam_profiles", "fam_event_invitees", "fam_tree_people"]) channel.on("postgres_changes", { event: "*", schema: "public", table: t }, () => scheduleReload());
   channel.on("postgres_changes", { event: "*", schema: "public", table: "fam_notifications", filter: `user_id=eq.${uid}` }, () => scheduleReload(200));
   channel.subscribe();
 }
@@ -261,12 +282,45 @@ async function checkForUpdate(manual = false) {
     return info;
   } catch (e) { if (manual) toast("לא ניתן לבדוק עדכונים כרגע. בדוק את החיבור לאינטרנט", "err"); return null; }
 }
+// עדכון בלחיצת כפתור: מוריד את הגרסה החדשה ומפעיל אותה מחדש — בלי להוריד ולהתקין קבצים.
+// הנתונים של המשתמשים שמורים בשרת ולא נמחקים בעדכון.
 async function applyUpdate() {
+  if (store.s.updating) return;
+  store.set({ updating: true });
+  LS.set("fam-updated-from", APP.version);
   try {
+    // מרענן את הקבצים הראשיים כדי שלא תיטען גרסה ישנה מהזיכרון של הדפדפן
+    await Promise.all(["./", "./index.html", "./config.js", "./version.json"].map((u) => fetch(u, { cache: "reload" }).catch(() => null)));
     const reg = await navigator.serviceWorker?.getRegistration();
-    if (reg) { await reg.update(); if (reg.waiting) reg.waiting.postMessage("skipWaiting"); }
+    if (reg) {
+      await reg.update().catch(() => {});
+      await new Promise((resolve) => {
+        let done = false; const fin = () => { if (!done) { done = true; resolve(); } };
+        navigator.serviceWorker.addEventListener("controllerchange", fin, { once: true });
+        const w = reg.installing || reg.waiting;
+        if (!w) { setTimeout(fin, 400); return; }
+        const kick = () => { if (reg.waiting) reg.waiting.postMessage("skipWaiting"); };
+        kick();
+        w.addEventListener("statechange", () => { kick(); if (w.state === "activated" || w.state === "redundant") fin(); });
+        setTimeout(fin, 12000);
+      });
+    }
   } catch (_) {}
-  setTimeout(() => location.reload(), 600);
+  const h = location.hash;
+  location.replace(location.pathname + "?u=" + Date.now() + h);
+}
+async function checkAndUpdate() {
+  const info = await checkForUpdate(true);
+  if (info?.available || info?.required) applyUpdate();
+}
+function afterUpdateCheck() {
+  const from = LS.get("fam-updated-from", null);
+  const params = new URLSearchParams(location.search);
+  if (params.has("u")) history.replaceState(null, "", location.pathname + location.hash);
+  if (!from) return;
+  LS.del("fam-updated-from");
+  if (cmpVer(APP.version, from) > 0) setTimeout(() => toast(`✅ האפליקציה עודכנה לגרסה ${APP.version}`, "ok"), 1200);
+  else setTimeout(() => toast("העדכון עדיין מתעדכן בשרת. נסו שוב בעוד כמה דקות", "err"), 1200);
 }
 
 // ================== רכיבי בסיס ==================
@@ -487,6 +541,7 @@ function Home() {
       <button class="stat" onClick=${() => go("calendar")}><div class="n">${mine.length}</div><div class="l">אירועים שאני מארגן</div></button>
     </div>
     <button class="btn warm block big" style="margin-bottom:16px" onClick=${() => go("new")}>➕ יצירת אירוע משפחתי</button>
+    <button class="tree-entry" onClick=${() => go("tree")}><span class="te-ic">🌳</span><span class="grow"><b>עץ המשפחה</b><span class="small">${s.tree.filter((p) => p.family_id === s.familyId).length ? `${s.tree.filter((p) => p.family_id === s.familyId).length} אנשים בעץ` : "חדש! הוסיפו את עצמכם ואת הדורות הקודמים"}</span></span><span>←</span></button>
     ${waiting.length ? html`<div class="card"><h2>🟡 ממתינים לתשובה שלך</h2>${waiting.map((e) => html`<${EventItem} ev=${e} />`)}</div>` : null}
     ${bdays.length ? html`<div class="card hide-simple"><h2>🎂 ימי הולדת קרובים</h2>${bdays.map((b) => html`<div class="list-item"><${Avatar} id=${b.p.id} size=${36} /><div class="grow"><div style="font-weight:600">${nameOf(b.p)}</div><div class="small muted">${fmtDate(b.nb.date, { weekday: undefined })} · ${hebDate(b.p.birthday, false)}</div></div><span class=${"chip " + (b.nb.days === 0 ? "warm" : "")}>${b.nb.days === 0 ? "היום! 🎉" : b.nb.days === 1 ? "מחר" : `בעוד ${b.nb.days} ימים`}</span></div>`)}</div>` : null}
     ${up.length > 1 ? html`<div class="card hide-simple"><h2>📅 בהמשך</h2>${up.slice(1, 6).map((e) => html`<${EventItem} ev=${e} />`)}</div>` : null}
@@ -801,6 +856,7 @@ function FamilyScreen() {
     <${FamilySwitcher} />
     <div class="card"><div class="row"><span style="font-size:2.2rem">👨‍👩‍👧‍👦</span><div class="grow"><div style="font-size:1.3rem;font-weight:800">${fam.name}</div><div class="small muted">${members.length} בני משפחה · התפקיד שלך: ${ROLE_LABEL[role]}</div></div>
       ${admin ? html`<button class="icon-btn" onClick=${() => setModal("rename")} aria-label="שינוי שם">✏️</button>` : null}</div></div>
+    <button class="tree-entry" onClick=${() => go("tree")}><span class="te-ic">🌳</span><span class="grow"><b>עץ המשפחה</b><span class="small">${s.tree.filter((p) => p.family_id === fid).length ? `${s.tree.filter((p) => p.family_id === fid).length} אנשים בעץ · הוסיפו את עצמכם ואת הדורות הקודמים` : "הוסיפו את עצמכם, את ההורים והסבים"}</span></span><span>←</span></button>
     ${admin ? html`<button class="btn green block big" style="margin-bottom:14px" onClick=${() => setModal("invite")}>➕ הזמנת בני משפחה</button>` : null}
     ${admin && pending.length ? html`<div class="card"><h2>⏳ בקשות הצטרפות (${pending.length})</h2>${pending.map((m) => html`<div class="list-item"><${Avatar} id=${m.user_id} size=${40} /><div class="grow"><div style="font-weight:600">${fullName(s.profiles[m.user_id])}</div><div class="small muted ltr" style="text-align:end">${s.profiles[m.user_id]?.login_id || ""}</div></div>
       <button class="btn green" disabled=${busy} onClick=${() => approve(m.user_id, true)}>אישור</button><button class="btn danger" disabled=${busy} onClick=${() => approve(m.user_id, false)}>דחייה</button></div>`)}</div>` : null}
@@ -978,6 +1034,10 @@ function SettingsScreen() {
       <${Field} label="גודל טקסט"><select class="input" value=${String(disp.scale)} onChange=${(e) => setDisplay({ scale: Number(e.target.value) })}><option value="1">רגיל</option><option value="1.15">גדול</option><option value="1.3">גדול מאוד</option></select><//>
       <label class="check"><input type="checkbox" checked=${disp.simple} onChange=${(e) => setDisplay({ simple: e.target.checked })} /> תצוגה פשוטה (מומלץ למבוגרים — פחות פרטים, כפתורים גדולים)</label>
     </div>
+    <div class="card"><h2>🔄 עדכון האפליקציה</h2>
+      <div class="small muted" style="margin-bottom:10px">גרסה מותקנת: ${APP.version}${s.update?.latest ? ` · גרסה אחרונה: ${s.update.latest}` : ""}. העדכון נעשה כאן בלחיצה — בלי להוריד ולהתקין קבצים, והנתונים נשמרים.</div>
+      ${s.update?.available || s.update?.required ? html`<button class="btn green block big" onClick=${applyUpdate}>⬇️ עדכון לגרסה ${s.update.latest}</button>` : html`<button class="btn block" onClick=${checkAndUpdate}>🔄 בדיקה אם יש עדכון</button>`}
+    </div>
     <div class="card"><h2>🛡️ המידע שלי</h2><div class="btn-grid">
       <button class="btn" disabled=${busy} onClick=${exportData}>📥 ייצוא המידע שלי</button>
       <button class="btn" onClick=${() => setModal("health")}>🔧 בדיקת תקינות האפליקציה</button>
@@ -1065,9 +1125,9 @@ function AboutScreen() {
       <div style="margin-top:6px">${APP.credit}</div>
       <div class="small muted" style="margin-top:6px">${APP.copyright}</div>
     </div>
-    ${s.update?.available ? html`<div class="ok-box row spread"><span>🎁 גרסה ${s.update.latest} זמינה</span><button class="btn green" onClick=${applyUpdate}>עדכון עכשיו</button></div>` : null}
+    ${s.update?.available ? html`<div class="ok-box row spread"><span>🎁 גרסה ${s.update.latest} זמינה</span><button class="btn green" onClick=${applyUpdate}>⬇️ עדכון עכשיו</button></div>` : null}
     <div class="btn-grid">
-      <button class="btn" onClick=${() => checkForUpdate(true)}>🔄 בדיקת עדכונים</button>
+      <button class="btn" onClick=${checkAndUpdate}>🔄 בדיקת עדכונים ועדכון</button>
       <button class="btn" onClick=${() => setModal("news")}>📋 מה חדש בגרסה?</button>
       <button class="btn" onClick=${() => setModal("health")}>🔧 בדיקת תקינות האפליקציה</button>
       <button class="btn" onClick=${() => setModal("bug")}>📩 דיווח על תקלה</button>
@@ -1098,7 +1158,318 @@ function BugModal({ onClose }) {
 }
 
 // ================== שלד האפליקציה ==================
-const TITLES = { home: "בית", calendar: "לוח שנה", new: "אירוע חדש", family: "המשפחה", notifications: "התראות", settings: "הגדרות", about: "אודות האפליקציה" };
+// ================== עץ משפחה ==================
+function treeIndex(list) {
+  const byId = {}; list.forEach((p) => (byId[p.id] = p));
+  const spouseOf = (p) => (p ? byId[p.spouse_id] || list.find((x) => x.spouse_id === p.id) || null : null);
+  const kidsOf = (ids) => list.filter((x) => ids.includes(x.father_id) || ids.includes(x.mother_id))
+    .sort((a, b) => (b.birth_date || "9999").localeCompare(a.birth_date || "9999")); // הבכור בצד ימין
+  const parentsOf = (p) => [byId[p?.father_id], byId[p?.mother_id]].filter(Boolean);
+  return { list, byId, spouseOf, kidsOf, parentsOf };
+}
+function treeYears(p) {
+  const by = p.birth_date ? p.birth_date.slice(0, 4) : "";
+  const dy = p.death_date ? p.death_date.slice(0, 4) : "";
+  if (p.is_deceased || dy) return by || dy ? `${by || "?"}–${dy || "?"}` : "";
+  return by ? `נולד/ה ${by}` : "";
+}
+function treeName(p) { return p ? `${p.first_name || ""} ${p.last_name || ""}`.trim() : ""; }
+// הנציג של "יחידה זוגית" שמתחילה ענף (כדי שזוג לא יופיע פעמיים כשורש)
+function treeRoots(ix) {
+  const out = [];
+  for (const p of ix.list) {
+    if (ix.parentsOf(p).length) continue;
+    const sp = ix.spouseOf(p);
+    if (sp && ix.parentsOf(sp).length) continue; // יופיע כבן/בת זוג בענף של ההורים של בן הזוג
+    if (sp && out.some((o) => o.id === sp.id)) continue;
+    out.push(p);
+  }
+  return out;
+}
+function treeCount(ix, root) {
+  const seen = new Set();
+  const walk = (p) => { if (!p || seen.has(p.id)) return; seen.add(p.id); const sp = ix.spouseOf(p); if (sp) seen.add(sp.id); ix.kidsOf([p.id, sp?.id].filter(Boolean)).forEach(walk); };
+  walk(root); return seen.size;
+}
+function treeTop(ix, p) {
+  const seen = new Set(); let cur = p;
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    const up = ix.byId[cur.father_id] || ix.byId[cur.mother_id];
+    if (up) { cur = up; continue; }
+    const sp = ix.spouseOf(cur); const spUp = sp && (ix.byId[sp.father_id] || ix.byId[sp.mother_id]);
+    if (spUp && !seen.has(spUp.id)) { cur = spUp; continue; }
+    break;
+  }
+  const roots = treeRoots(ix); const sp = ix.spouseOf(cur);
+  return roots.find((r) => r.id === cur.id || r.id === sp?.id) || cur;
+}
+function canEditTree(s, p) { const uid = s.session.user.id; return p.created_by === uid || p.linked_user_id === uid || isAdmin(s, p.family_id); }
+function canDeleteTree(s, p) { const uid = s.session.user.id; return p.created_by === uid || isAdmin(s, p.family_id); }
+
+function TreeAvatar({ p, size = 56 }) {
+  const s = useStore();
+  const url = s.treePhotos[p.id] || (p.linked_user_id && s.avatars[p.linked_user_id]);
+  const bg = p.gender === "female" ? "linear-gradient(135deg,#f3a6c4,#d9779f)" : p.gender === "male" ? "linear-gradient(135deg,#8fb6ee,#5b88d6)" : "linear-gradient(135deg,#b9c4d2,#8796aa)";
+  const st = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.46)}px;background:${bg}`;
+  const ini = (p.first_name || "?").trim()[0] || "?";
+  return url ? html`<img class="avatar t-photo" style=${st} src=${url} alt=${treeName(p)} />` : html`<span class="avatar t-photo" style=${st} aria-label=${treeName(p)}>${ini}</span>`;
+}
+function TreeCard({ p, me, onOpen }) {
+  const yrs = treeYears(p);
+  return html`<button class=${"t-card" + (p.gender === "female" ? " f" : p.gender === "male" ? " m" : "") + (p.is_deceased ? " dec" : "") + (me ? " me" : "")} onClick=${() => onOpen(p.id)}>
+    <${TreeAvatar} p=${p} />
+    <div class="t-name">${p.first_name}${p.is_deceased ? html` <span class="t-zl">ז״ל</span>` : null}</div>
+    <div class="t-last">${p.last_name || "\u00a0"}${p.maiden_name ? html`<span class="t-maiden"> (לבית ${p.maiden_name})</span>` : null}</div>
+    ${yrs ? html`<div class="t-years">${yrs}</div>` : null}
+    ${me ? html`<span class="t-badge">אני</span>` : p.linked_user_id ? html`<span class="t-badge app" title="משתמש/ת באפליקציה">❤️</span>` : null}
+  </button>`;
+}
+function TreeBranch({ ix, p, seen, uid, onOpen }) {
+  if (seen.has(p.id)) return null;
+  seen.add(p.id);
+  const sp = ix.spouseOf(p); if (sp) seen.add(sp.id);
+  const kids = ix.kidsOf([p.id, sp?.id].filter(Boolean)).filter((k) => !seen.has(k.id));
+  // בתצוגה (שמאל לימין) — הגבר משמאל והאישה מימין, כמו בתמונת זוג
+  const pair = sp ? (p.gender === "female" ? [sp, p] : [p, sp]) : [p];
+  return html`<li>
+    <div class=${"t-unit" + (sp ? " couple" : "")}>
+      ${pair.map((x, i) => html`${i === 1 ? html`<span class="t-ring" aria-hidden="true">💍</span>` : null}<${TreeCard} p=${x} me=${x.linked_user_id === uid} onOpen=${onOpen} />`)}
+    </div>
+    ${kids.length ? html`<ul>${kids.map((k) => html`<${TreeBranch} ix=${ix} p=${k} seen=${seen} uid=${uid} onOpen=${onOpen} />`)}</ul>` : null}
+  </li>`;
+}
+
+function TreeScreen() {
+  const s = useStore(); const uid = s.session.user.id; const fid = s.familyId;
+  const fam = s.families.find((f) => f.id === fid);
+  const list = s.tree.filter((p) => p.family_id === fid);
+  const ix = useMemo(() => treeIndex(list), [s.tree, fid]);
+  const mine = list.find((p) => p.linked_user_id === uid);
+  const roots = treeRoots(ix);
+  const [rootId, setRootId] = useState(LS.get("fam-tree-root-" + fid, null));
+  const [view, setView] = useState("tree");
+  const [zoom, setZoom] = useState(LS.get("fam-tree-zoom", 1));
+  const [q, setQ] = useState("");
+  const [modal, setModal] = useState(null);
+  const wrap = useRef(null);
+  let root = roots.find((r) => r.id === rootId);
+  if (!root && rootId && ix.byId[rootId]) root = ix.byId[rootId];
+  if (!root) root = mine ? treeTop(ix, mine) : roots.slice().sort((a, b) => treeCount(ix, b) - treeCount(ix, a))[0];
+  const shown = root ? treeCount(ix, root) : 0;
+  useEffect(() => { const w = wrap.current; if (w) w.scrollLeft = (w.scrollWidth - w.clientWidth) / 2; }, [root?.id, view, list.length]);
+  const pickRoot = (id) => { setRootId(id); LS.set("fam-tree-root-" + fid, id); };
+  const setZ = (z) => { const v = Math.max(0.4, Math.min(1.6, Math.round(z * 10) / 10)); setZoom(v); LS.set("fam-tree-zoom", v); };
+  const open = (id) => setModal({ kind: "person", id });
+  const addSelf = () => setModal({ kind: "form", mode: "self" });
+  const filtered = list.filter((p) => !q.trim() || `${treeName(p)} ${p.maiden_name || ""} ${p.birth_place || ""}`.includes(q.trim()))
+    .sort((a, b) => treeName(a).localeCompare(treeName(b), "he"));
+  return html`<div class="page">
+    <${FamilySwitcher} />
+    <div class="card tree-hero">
+      <div class="row"><span style="font-size:2.4rem">🌳</span><div class="grow"><div style="font-size:1.3rem;font-weight:800">עץ המשפחה${fam ? ` · ${fam.name}` : ""}</div>
+      <div class="small muted">${list.length ? `${list.length} אנשים בעץ · כל בן משפחה יכול להוסיף את עצמו ואת הדורות הקודמים` : "כל בן משפחה יכול להוסיף את עצמו, את ההורים, הסבים והסבתות"}</div></div></div>
+      ${!mine ? html`<button class="btn green block big" style="margin-top:12px" onClick=${addSelf}>🙋 הוספת עצמי לעץ</button>` : html`<button class="btn block" style="margin-top:12px" onClick=${() => open(mine.id)}>👤 הכרטיס שלי בעץ — הוספת הורים, בן/בת זוג וילדים</button>`}
+    </div>
+    ${!list.length ? html`<div class="card center tree-empty">
+        <div style="font-size:3rem">🌱</div>
+        <h2>העץ עדיין ריק</h2>
+        <p class="muted">התחילו מעצמכם, ואז הוסיפו הורים, סבים וסבתות. כל אחד מבני המשפחה יכול להשלים את הענף שלו.</p>
+      </div>` : html`
+    <div class="row wrap" style="margin-bottom:10px">
+      <div class="seg"><button class=${view === "tree" ? "on" : ""} onClick=${() => setView("tree")}>🌳 עץ</button><button class=${view === "list" ? "on" : ""} onClick=${() => setView("list")}>📋 רשימה</button></div>
+      ${view === "tree" ? html`<div class="row" style="margin-inline-start:auto;gap:6px"><button class="icon-btn" onClick=${() => setZ(zoom - 0.1)} aria-label="הקטנה">➖</button><span class="small muted" style="min-width:42px;text-align:center">${Math.round(zoom * 100)}%</span><button class="icon-btn" onClick=${() => setZ(zoom + 0.1)} aria-label="הגדלה">➕</button></div>` : null}
+    </div>
+    ${view === "tree" ? html`
+      ${roots.length > 1 || (root && !roots.some((r) => r.id === root.id)) ? html`<${Field} label="הענף המוצג">
+        <select class="input" value=${root?.id} onChange=${(e) => pickRoot(e.target.value)}>
+          ${root && !roots.some((r) => r.id === root.id) ? html`<option value=${root.id}>החל מ: ${treeName(root)}</option>` : null}
+          ${roots.map((r) => { const sp = ix.spouseOf(r); return html`<option value=${r.id}>משפחת ${treeName(r)}${sp ? ` ו${sp.first_name}` : ""} (${treeCount(ix, r)} אנשים)</option>`; })}
+        </select><//>` : null}
+      <div class="tree-wrap" ref=${wrap}>
+        <div class="ftree" style=${`zoom:${zoom}`}>
+          ${root ? html`<ul>${html`<${TreeBranch} ix=${ix} p=${root} seen=${new Set()} uid=${uid} onOpen=${open} />`}</ul>` : null}
+        </div>
+      </div>
+      <div class="small muted center" style="margin-top:8px">${shown < list.length ? `מוצגים ${shown} מתוך ${list.length} · שאר האנשים בענפים אחרים — בחרו ענף למעלה` : "גוללים לצדדים כדי לראות את כל העץ · לחיצה על אדם פותחת את הכרטיס שלו"}</div>
+    ` : html`<div class="card">
+      <input class="input" placeholder="🔍 חיפוש לפי שם או מקום לידה" value=${q} onInput=${(e) => setQ(e.target.value)} style="margin-bottom:6px" />
+      ${filtered.map((p) => html`<button class="list-item tree-li" onClick=${() => open(p.id)}><${TreeAvatar} p=${p} size=${42} /><div class="grow" style="text-align:start"><div style="font-weight:700">${treeName(p)}${p.is_deceased ? " ז״ל" : ""}${p.linked_user_id === uid ? html` <span class="chip">אני</span>` : null}</div><div class="small muted">${[treeYears(p), p.birth_place].filter(Boolean).join(" · ") || "\u00a0"}</div></div><span class="muted">←</span></button>`)}
+      ${!filtered.length ? html`<p class="muted center">לא נמצאו אנשים</p>` : null}
+    </div>`}`}
+    ${modal?.kind === "person" && ix.byId[modal.id] ? html`<${TreePersonModal} ix=${ix} p=${ix.byId[modal.id]} mine=${mine} setModal=${setModal} onShowFrom=${(id) => { pickRoot(id); setView("tree"); setModal(null); }} />` : null}
+    ${modal?.kind === "form" ? html`<${TreePersonForm} ix=${ix} ...${modal} onClose=${() => setModal(null)} onSaved=${(id) => setModal(id ? { kind: "person", id } : null)} />` : null}
+  </div>`;
+}
+
+const REL_LABEL = { father: "הוספת אבא", mother: "הוספת אמא", spouse: "הוספת בן/בת זוג", child: "הוספת ילד/ה", self: "הוספת עצמי לעץ", edit: "עריכת פרטים" };
+function TreePersonModal({ ix, p, mine, setModal, onShowFrom }) {
+  const s = useStore(); const uid = s.session.user.id;
+  const [busy, run] = useBusy(); const [confirm, setConfirm] = useState(null);
+  const father = ix.byId[p.father_id], mother = ix.byId[p.mother_id], sp = ix.spouseOf(p);
+  const kids = ix.kidsOf([p.id]);
+  const sibs = ix.list.filter((x) => x.id !== p.id && ((p.father_id && x.father_id === p.father_id) || (p.mother_id && x.mother_id === p.mother_id)));
+  const editable = canEditTree(s, p); const deletable = canDeleteTree(s, p);
+  const linkedProfile = p.linked_user_id ? s.profiles[p.linked_user_id] : null;
+  const close = () => setModal(null);
+  const claim = () => run(async () => {
+    const { error } = await sb.from("fam_tree_people").update({ linked_user_id: uid }).eq("id", p.id); if (error) throw error;
+    await loadTree(); toast("סומן שזה את/ה ❤️", "ok");
+  });
+  const unclaim = () => run(async () => {
+    const { error } = await sb.from("fam_tree_people").update({ linked_user_id: null }).eq("id", p.id); if (error) throw error;
+    await loadTree(); toast("הקישור לחשבון הוסר", "ok");
+  });
+  const unlink = (field, label) => setConfirm({ text: `להסיר את הקשר "${label}"? האנשים עצמם יישארו בעץ.`, yes: "הסרת הקשר", fn: async () => {
+    const { error } = await sb.from("fam_tree_people").update({ [field]: null }).eq("id", p.id); if (error) throw error; await loadTree(); toast("הקשר הוסר", "ok");
+  } });
+  const del = () => setConfirm({ text: `למחוק את ${treeName(p)} מהעץ? הקשרים שלו/ה יוסרו, ושאר האנשים יישארו בעץ.`, yes: "מחיקה", danger: true, fn: async () => {
+    const { error } = await sb.from("fam_tree_people").delete().eq("id", p.id); if (error) throw error; await loadTree(); close(); toast("נמחק מהעץ", "ok");
+  } });
+  const Chip = ({ x, onRemove }) => html`<span class="t-rel"><button class="t-rel-btn" onClick=${() => setModal({ kind: "person", id: x.id })}><${TreeAvatar} p=${x} size=${28} /> ${treeName(x)}</button>${onRemove ? html`<button class="t-rel-x" onClick=${onRemove} aria-label="הסרת הקשר">✕</button>` : null}</span>`;
+  return html`<${Modal} title=${treeName(p)} onClose=${close}>
+    <div class="center" style="margin-bottom:10px">
+      <div style="display:inline-block"><${TreeAvatar} p=${p} size=${96} /></div>
+      <div style="font-size:1.3rem;font-weight:800;margin-top:6px">${treeName(p)}${p.is_deceased ? " ז״ל" : ""}</div>
+      ${p.maiden_name ? html`<div class="muted">לבית ${p.maiden_name}</div>` : null}
+      ${p.linked_user_id === uid ? html`<span class="chip">זה אני</span>` : linkedProfile ? html`<span class="chip green">❤️ ${nameOf(linkedProfile)} באפליקציה</span>` : null}
+    </div>
+    <div class="t-facts">
+      ${p.birth_date ? html`<div>🎂 נולד/ה: ${fmtDate(p.birth_date, { weekday: undefined, year: "numeric" })} · ${hebDate(p.birth_date)}</div>` : null}
+      ${p.birth_place ? html`<div>📍 מקום לידה: ${p.birth_place}</div>` : null}
+      ${p.death_date ? html`<div>🕯️ נפטר/ה: ${fmtDate(p.death_date, { weekday: undefined, year: "numeric" })} · ${hebDate(p.death_date)}</div>` : p.is_deceased ? html`<div>🕯️ ז״ל</div>` : null}
+      ${p.bio ? html`<div class="t-bio">${p.bio}</div>` : null}
+    </div>
+    <div class="t-rels">
+      <div><b>הורים:</b> ${father ? html`<${Chip} x=${father} onRemove=${() => unlink("father_id", "אבא")} />` : null}${mother ? html`<${Chip} x=${mother} onRemove=${() => unlink("mother_id", "אמא")} />` : null}${!father && !mother ? html`<span class="muted">עדיין לא נוספו</span>` : null}</div>
+      <div><b>בן/בת זוג:</b> ${sp ? html`<${Chip} x=${sp} onRemove=${() => unlink("spouse_id", "בן/בת זוג")} />` : html`<span class="muted">—</span>`}</div>
+      ${kids.length ? html`<div><b>ילדים:</b> ${kids.map((k) => html`<${Chip} x=${k} />`)}</div>` : null}
+      ${sibs.length ? html`<div><b>אחים ואחיות:</b> ${sibs.map((k) => html`<${Chip} x=${k} />`)}</div>` : null}
+    </div>
+    <div class="btn-grid" style="margin-top:12px">
+      ${!father ? html`<button class="btn" onClick=${() => setModal({ kind: "form", mode: "father", of: p.id })}>👨 הוספת אבא</button>` : null}
+      ${!mother ? html`<button class="btn" onClick=${() => setModal({ kind: "form", mode: "mother", of: p.id })}>👩 הוספת אמא</button>` : null}
+      ${!sp ? html`<button class="btn" onClick=${() => setModal({ kind: "form", mode: "spouse", of: p.id })}>💑 הוספת בן/בת זוג</button>` : null}
+      <button class="btn" onClick=${() => setModal({ kind: "form", mode: "child", of: p.id })}>👶 הוספת ילד/ה</button>
+      ${editable ? html`<button class="btn primary" onClick=${() => setModal({ kind: "form", mode: "edit", of: p.id })}>✏️ עריכת פרטים</button>` : null}
+      <button class="btn" onClick=${() => onShowFrom(p.id)}>🌳 הצגת העץ החל ממנו/ה</button>
+      ${!p.linked_user_id && !mine ? html`<button class="btn green" disabled=${busy} onClick=${claim}>🙋 זה אני</button>` : null}
+      ${p.linked_user_id && (p.linked_user_id === uid || isAdmin(s, p.family_id)) ? html`<button class="btn" disabled=${busy} onClick=${unclaim}>🔗 ביטול "זה אני"</button>` : null}
+      ${deletable ? html`<button class="btn danger" onClick=${del}>🗑️ מחיקה מהעץ</button>` : null}
+    </div>
+    ${!editable ? html`<div class="small muted" style="margin-top:10px">את הפרטים של אדם זה יכולים לערוך רק מי שהוסיף אותו, האדם עצמו או מנהל. קשרים (הורים, ילדים, בן/בת זוג) כל בן משפחה יכול להוסיף.</div>` : null}
+  <//>
+  ${confirm ? html`<${Confirm} text=${confirm.text} yes=${confirm.yes} danger=${confirm.danger} onYes=${confirm.fn} onClose=${() => setConfirm(null)} />` : null}`;
+}
+
+function TreePersonForm({ ix, mode, of, onClose, onSaved }) {
+  const s = useStore(); const uid = s.session.user.id; const fid = s.familyId; const me = s.me || {};
+  const target = of ? ix.byId[of] : null;
+  const editing = mode === "edit" ? target : null;
+  const forcedGender = mode === "father" ? "male" : mode === "mother" ? "female" : null;
+  const base = editing || (mode === "self" ? { first_name: me.first_name || "", last_name: me.last_name || "", birth_date: me.birthday || "" }
+    : { last_name: mode === "father" ? target?.maiden_name || target?.last_name || ""
+      : mode === "mother" ? target?.last_name || ""
+      : mode === "child" ? (target?.gender === "female" ? ix.spouseOf(target)?.last_name || target?.last_name : target?.last_name) || "" : "" });
+  const [f, setF] = useState({ first_name: base.first_name || "", last_name: base.last_name || "", maiden_name: base.maiden_name || "", gender: base.gender || forcedGender || (mode === "spouse" && target?.gender ? (target.gender === "male" ? "female" : "male") : ""), birth_date: base.birth_date || "", is_deceased: !!base.is_deceased, death_date: base.death_date || "", birth_place: base.birth_place || "", bio: base.bio || "" });
+  const [existing, setExisting] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [busy, run] = useBusy();
+  const fileRef = useRef(null);
+  const up = (k) => (e) => setF({ ...f, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value });
+  // אנשים קיימים שאפשר לחבר במקום להוסיף אדם חדש
+  const cands = mode && !["self", "edit"].includes(mode) && target ? ix.list.filter((x) => x.id !== target.id
+    && (mode === "father" ? x.gender !== "female" : mode === "mother" ? x.gender !== "male" : true)
+    && (mode !== "spouse" || !ix.spouseOf(x))
+    && (mode !== "child" || (!x.father_id && !x.mother_id) || (target.gender === "female" ? !x.mother_id : !x.father_id))
+    && x.id !== target.father_id && x.id !== target.mother_id) : [];
+  const relFor = (newId) => {
+    // עדכון שצריך לבצע על אנשים קיימים כדי לחבר את האדם החדש
+    if (mode === "father") return [{ id: target.id, patch: { father_id: newId } }];
+    if (mode === "mother") return [{ id: target.id, patch: { mother_id: newId } }];
+    if (mode === "spouse") return [{ id: target.id, patch: { spouse_id: newId } }];
+    if (mode === "child") {
+      const sp = ix.spouseOf(target); const isMom = target.gender === "female";
+      const patch = isMom ? { mother_id: target.id } : { father_id: target.id };
+      if (sp && sp.gender !== target.gender) Object.assign(patch, isMom ? { father_id: sp.id } : { mother_id: sp.id });
+      return [{ id: newId, patch }];
+    }
+    return [];
+  };
+  const save = () => run(async () => {
+    let id = editing?.id;
+    if (existing) {
+      id = existing;
+      for (const r of relFor(existing)) { const { error } = await sb.from("fam_tree_people").update(r.patch).eq("id", r.id); if (error) throw error; }
+    } else {
+      if (!f.first_name.trim()) throw new Error("יש להזין שם פרטי");
+      if (f.death_date && f.birth_date && f.death_date < f.birth_date) throw new Error("תאריך הפטירה לא יכול להיות לפני תאריך הלידה");
+      const row = { first_name: f.first_name.trim(), last_name: f.last_name.trim() || null, maiden_name: f.gender === "female" ? f.maiden_name.trim() || null : null, gender: f.gender || null,
+        birth_date: f.birth_date || null, is_deceased: f.is_deceased || !!f.death_date, death_date: f.is_deceased ? f.death_date || null : null, birth_place: f.birth_place.trim() || null, bio: f.bio.trim() || null };
+      if (editing) {
+        const { error } = await sb.from("fam_tree_people").update(row).eq("id", editing.id); if (error) throw error;
+      } else {
+        Object.assign(row, { family_id: fid, created_by: uid });
+        if (mode === "self") row.linked_user_id = uid;
+        // כשמוסיפים אבא ויש כבר אמא (או להפך) — מחברים ביניהם כזוג
+        if (mode === "father" && target.mother_id && !ix.spouseOf(ix.byId[target.mother_id])) row.spouse_id = target.mother_id;
+        if (mode === "mother" && target.father_id && !ix.spouseOf(ix.byId[target.father_id])) row.spouse_id = target.father_id;
+        if (mode === "spouse") row.spouse_id = target.id;
+        if (mode === "child") Object.assign(row, relFor(null)[0].patch);
+        const { data, error } = await sb.from("fam_tree_people").insert(row).select("id").single(); if (error) throw error;
+        id = data.id;
+        if (mode !== "child" && mode !== "spouse") for (const r of relFor(id)) { const { error: e2 } = await sb.from("fam_tree_people").update(r.patch).eq("id", r.id); if (e2) throw e2; }
+      }
+      if (photo) {
+        const blob = await resizeImage(photo, 500);
+        const path = `${uid}/tree-${id}-${Date.now()}.jpg`;
+        const { error: e3 } = await sb.storage.from("fam-media").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+        if (e3) throw e3;
+        const { error: e4 } = await sb.from("fam_tree_people").update({ photo_path: path }).eq("id", id); if (e4) throw e4;
+      }
+    }
+    await loadTree();
+    toast(editing ? "הפרטים נשמרו" : existing ? "הקשר נוסף לעץ 🌳" : "נוסף לעץ המשפחה 🌳", "ok");
+    onSaved(mode === "self" || mode === "edit" ? id : target?.id || id);
+  });
+  const removePhoto = () => run(async () => {
+    const { error } = await sb.from("fam_tree_people").update({ photo_path: null }).eq("id", editing.id); if (error) throw error;
+    const tp = { ...store.s.treePhotos }; delete tp[editing.id]; store.set({ treePhotos: tp }); await loadTree(); toast("התמונה הוסרה", "ok");
+  });
+  const title = REL_LABEL[mode] + (target && mode !== "edit" ? ` ל${target.first_name}` : "");
+  return html`<${Modal} title=${title} onClose=${onClose}>
+    ${cands.length ? html`<${Field} label="לבחור אדם שכבר נמצא בעץ" hint="אם האדם כבר נוסף ע״י מישהו אחר — בחרו אותו כאן כדי לחבר את הענפים">
+      <select class="input" value=${existing} onChange=${(e) => setExisting(e.target.value)}>
+        <option value="">— אדם חדש —</option>
+        ${cands.map((x) => html`<option value=${x.id}>${treeName(x)}${x.birth_date ? ` (${x.birth_date.slice(0, 4)})` : ""}</option>`)}
+      </select><//>` : null}
+    ${existing ? null : html`
+      ${!forcedGender ? html`<${Field} label="מין"><div class="seg block"><button class=${f.gender === "male" ? "on" : ""} onClick=${() => setF({ ...f, gender: "male" })}>👨 זכר</button><button class=${f.gender === "female" ? "on" : ""} onClick=${() => setF({ ...f, gender: "female" })}>👩 נקבה</button></div><//>` : null}
+      <${Field} label="שם פרטי *"><input class="input" value=${f.first_name} onInput=${up("first_name")} maxlength="40" /><//>
+      <${Field} label="שם משפחה"><input class="input" value=${f.last_name} onInput=${up("last_name")} maxlength="40" /><//>
+      ${f.gender === "female" ? html`<${Field} label="שם נעורים (לבית)"><input class="input" value=${f.maiden_name} onInput=${up("maiden_name")} maxlength="40" /><//>` : null}
+      <${Field} label="תאריך לידה" hint="אפשר להשאיר ריק אם לא ידוע"><input class="input" type="date" value=${f.birth_date} onInput=${up("birth_date")} max=${new Date().toISOString().slice(0, 10)} /><//>
+      <${Field} label="מקום לידה"><input class="input" value=${f.birth_place} onInput=${up("birth_place")} maxlength="80" placeholder="למשל: ירושלים, מרוקו, פולין" /><//>
+      <label class="check"><input type="checkbox" checked=${f.is_deceased} onChange=${up("is_deceased")} /> נפטר/ה (ז״ל)</label>
+      ${f.is_deceased ? html`<${Field} label="תאריך פטירה"><input class="input" type="date" value=${f.death_date} onInput=${up("death_date")} max=${new Date().toISOString().slice(0, 10)} /><//>` : null}
+      <${Field} label="כמה מילים (סיפור, מקצוע, זיכרון)"><textarea class="input" value=${f.bio} onInput=${up("bio")} maxlength="1000"></textarea><//>
+      <${Field} label="תמונה">
+        <div class="row wrap">
+          ${editing && (store.s.treePhotos[editing.id]) && !photo ? html`<img class="avatar" style="width:56px;height:56px" src=${store.s.treePhotos[editing.id]} alt="" />` : null}
+          ${photo ? html`<span class="chip green">✓ נבחרה תמונה</span>` : null}
+          <button class="btn" onClick=${() => fileRef.current?.click()}>🖼️ בחירת תמונה</button>
+          ${editing?.photo_path && !photo ? html`<button class="btn danger" disabled=${busy} onClick=${removePhoto}>הסרת תמונה</button>` : null}
+          <input ref=${fileRef} type="file" accept="image/*" hidden onChange=${(e) => setPhoto(e.target.files?.[0] || null)} />
+        </div><//>
+    `}
+    <div class="btn-grid" style="margin-top:6px">
+      <button class="btn primary big" disabled=${busy} onClick=${save}>${busy ? "שומר…" : existing ? "🔗 חיבור לעץ" : "💾 שמירה"}</button>
+      <button class="btn" onClick=${onClose}>ביטול</button>
+    </div>
+  <//>`;
+}
+
+const TITLES = { home: "בית", calendar: "לוח שנה", new: "אירוע חדש", family: "המשפחה", notifications: "התראות", settings: "הגדרות", about: "אודות האפליקציה", tree: "עץ המשפחה" };
 function Shell() {
   const s = useStore(); const route = useRoute();
   const [base, arg] = route.split(/-(.+)/);
@@ -1114,11 +1485,12 @@ function Shell() {
   else if (base === "notifications") screen = html`<${NotificationsScreen} />`;
   else if (base === "settings") screen = html`<${SettingsScreen} key=${s.me?.updated_at} />`;
   else if (base === "about") screen = html`<${AboutScreen} />`;
+  else if (base === "tree") screen = html`<${TreeScreen} />`;
   else { screen = html`<${Home} />`; title = APP.name; }
   const NAV = [["home", "🏠", "בית"], ["calendar", "📅", "לוח שנה"], ["new", "➕", "אירוע חדש"], ["family", "👨‍👩‍👧‍👦", "המשפחה"], ["notifications", "🔔", "התראות"]];
   return html`<div class="app">
     ${!s.online ? html`<div class="banner offline">📴 אין חיבור לאינטרנט — מוצג המידע האחרון שנשמר${s.queue.length ? ` · ${s.queue.length} פעולות ימתינו לסנכרון` : ""}</div>` : null}
-    ${s.update?.required ? html`<div class="banner">⚠️ הגרסה המותקנת ישנה מדי ויש לעדכן<button class="btn" onClick=${applyUpdate}>עדכון</button></div>` : s.update?.available ? html`<div class="banner">🎁 גרסה חדשה (${s.update.latest}) זמינה<button class="btn" onClick=${applyUpdate}>עדכון</button></div>` : null}
+    ${s.update?.required || s.update?.available ? html`<div class="banner update"><span class="grow">${s.update.required ? "⚠️ יש לעדכן את האפליקציה" : `🎁 יש עדכון חדש · גרסה ${s.update.latest}`}</span><button class="btn green" onClick=${applyUpdate}>⬇️ עדכון בלחיצה</button></div>` : null}
     <div class="topbar">
       ${["home", "calendar", "family", "notifications", ""].includes(base) || !hasFamily ? html`<span style="font-size:1.3rem">❤️</span>` : html`<button class="icon-btn" onClick=${() => history.length > 1 ? history.back() : go("home")} aria-label="חזרה">→</button>`}
       <h1>${title}</h1>
@@ -1133,6 +1505,7 @@ function Shell() {
 function Root() {
   const s = useStore();
   return html`${s.boot ? html`<${Splash} />` : !s.session ? html`<${AuthScreen} />` : html`<${Shell} />`}
+    ${s.updating ? html`<div class="update-overlay" role="status"><div class="spinner"></div><div style="font-size:1.2rem;font-weight:800">מעדכן את האפליקציה…</div><div class="small">זה לוקח כמה שניות. הנתונים שלכם שמורים ולא יימחקו.</div></div>` : null}
     ${s.toast ? html`<div class=${"toast " + (s.toast.kind || "")} role="status">${s.toast.msg}</div>` : null}`;
 }
 
@@ -1153,6 +1526,7 @@ async function onSession(session) {
 }
 async function boot() {
   window.__booted = true;
+  afterUpdateCheck();
   applyDisplay();
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", applyDisplay);
   const params = new URLSearchParams(location.search);
@@ -1172,6 +1546,6 @@ async function boot() {
   window.addEventListener("offline", () => store.set({ online: false }));
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && store.s.session) { scheduleReload(200); checkForUpdate(false); } });
   checkForUpdate(false);
-  setInterval(() => checkForUpdate(false), 6 * 3600 * 1000);
+  setInterval(() => checkForUpdate(false), 30 * 60 * 1000);
 }
 boot();
